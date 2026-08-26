@@ -28,7 +28,7 @@ top-level build/test — always `cd python/` or `cd dotnet/` first.**
 | `docs/decisions/` | ADRs (architectural decision records) — numbered `NNNN-title.md`, templates at `adr-template.md` / `adr-short-template.md`. Propose architectural changes here. |
 | `docs/design/`, `docs/features/`, `docs/specs/` | Design docs, feature write-ups, and specs. |
 | `schemas/` | Shared JSON schemas (e.g. `durable-agent-entity-state.json`) consumed by both language implementations. |
-| `.github/skills/` | Task-specific agent skill docs (build-and-test, project-structure, pull-requests, python-*) loaded on demand — see the per-language `AGENTS.md` for which ones apply. |
+| `.github/skills/` | Repo-wide agent skill docs, loaded on demand. Currently just `pull-requests` — the language-specific skills live per tree: `dotnet/.github/skills/` (`build-and-test`, `project-structure`, `verify-dotnet-samples`, `verify-samples-tool`, `pull-requests`) and `python/.github/skills/` (`python-development`, `python-testing`, `python-code-quality`, `python-feature-lifecycle`, `python-package-management`, `python-samples`, `pull-requests`). |
 | `.github/copilot-instructions.md` | The GitHub Copilot equivalent of this file; keep the two in sync if repo-wide structure changes. |
 
 ## Commands
