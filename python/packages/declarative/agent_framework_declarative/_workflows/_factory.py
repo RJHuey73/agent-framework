@@ -119,9 +119,11 @@ class WorkflowFactory:
                 ``InvokeMcpTool``. Required if the workflow contains any
                 ``InvokeMcpTool``; build will fail with :class:`DeclarativeWorkflowError`
                 otherwise. Use :class:`agent_framework.declarative.DefaultMCPToolHandler`
-                for a default backed by :class:`agent_framework.MCPStreamableHTTPTool`,
-                or supply your own implementation to enforce SSRF guards, allowlisting,
-                or auth/connection resolution.
+                for a default backed by :class:`agent_framework.MCPStreamableHTTPTool` that
+                already rejects private/loopback/link-local/reserved ``server_url`` targets
+                (pass ``allowed_hosts`` to it to trust a specific internal host), or supply
+                your own implementation for a stronger policy (DNS-rebinding resistance,
+                custom allowlisting, or auth/connection resolution).
             configuration: Optional mapping that populates the PowerFx ``Env``
                 symbol referenced from workflow YAML expressions (e.g.
                 ``=Env.MY_KEY``). Keys supplied here are always exposed

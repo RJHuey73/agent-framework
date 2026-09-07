@@ -13,6 +13,7 @@ owned-vs-caller httpx close semantics.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import sys
 from typing import Any
@@ -25,7 +26,10 @@ from agent_framework.exceptions import ToolExecutionException
 
 from agent_framework_declarative._workflows._mcp_handler import (
     DefaultMCPToolHandler,
+    MCPServerURLBlockedError,
     MCPToolInvocation,
+    _blocked_ip_reason,
+    _validate_server_url,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -787,3 +791,182 @@ class TestListTools:
         # Constant must equal the MCP protocol method name so a single
         # string travels unchanged through host code, YAML, and the wire.
         assert DefaultMCPToolHandler.LIST_TOOLS_TOOL_NAME == "tools/list"
+
+
+# ---------- server_url SSRF guard ------------------------------------------
+#
+# All cases below use IP *literals* in the URL, never a hostname requiring
+# live DNS -- ``ipaddress.ip_address(...)`` parses an IP literal directly,
+# with no network call, so these are deterministic regardless of whether
+# this environment has outbound network access.
+
+
+class TestBlockedIpReason:
+    """``_blocked_ip_reason`` tested directly against hardcoded IP strings."""
+
+    @pytest.mark.parametrize(
+        ("ip", "expected_reason"),
+        [
+            ("127.0.0.1", "loopback"),
+            ("::1", "loopback"),
+            # The headline case: link-local covers the 169.254.0.0/16 cloud
+            # metadata endpoint range explicitly called out by the finding.
+            ("169.254.169.254", "link-local"),
+            ("169.254.1.1", "link-local"),
+            ("fe80::1", "link-local"),
+            ("10.0.0.5", "private"),
+            ("172.16.0.1", "private"),
+            ("192.168.1.1", "private"),
+            ("fc00::1", "private"),
+            ("0.0.0.0", "unspecified"),
+            ("::", "unspecified"),
+            ("224.0.0.1", "multicast"),
+            ("ff02::1", "multicast"),
+        ],
+    )
+    def test_flags_disallowed_ranges(self, ip: str, expected_reason: str) -> None:
+        assert _blocked_ip_reason(ipaddress.ip_address(ip)) == expected_reason
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "8.8.8.8",  # Google public DNS
+            "1.1.1.1",  # Cloudflare public DNS
+            "93.184.216.34",  # example.com (public)
+            "2001:4860:4860::8888",  # Google public DNS, IPv6
+        ],
+    )
+    def test_allows_public_addresses(self, ip: str) -> None:
+        assert _blocked_ip_reason(ipaddress.ip_address(ip)) is None
+
+
+class TestValidateServerUrl:
+    """``_validate_server_url`` tested directly, with IP-literal URLs (no live DNS)."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_link_local_metadata_endpoint(self) -> None:
+        """The canonical SSRF target: the cloud metadata endpoint."""
+        with pytest.raises(MCPServerURLBlockedError, match="link-local"):
+            await _validate_server_url("http://169.254.169.254/latest/meta-data/", None)
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [
+            "http://127.0.0.1:8080/mcp",
+            "http://[::1]:8080/mcp",
+            "https://10.0.0.5/mcp",
+            "https://192.168.1.1/mcp",
+            "http://0.0.0.0/mcp",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_rejects_other_disallowed_ranges(self, server_url: str) -> None:
+        with pytest.raises(MCPServerURLBlockedError):
+            await _validate_server_url(server_url, None)
+
+    @pytest.mark.asyncio
+    async def test_allows_public_ip_literal(self) -> None:
+        """A normal, publicly-routable IP literal is unaffected."""
+        await _validate_server_url("https://8.8.8.8/mcp", None)
+
+    @pytest.mark.asyncio
+    async def test_allowed_hosts_overrides_block(self) -> None:
+        """An explicitly-allowlisted host bypasses the private-range check."""
+        await _validate_server_url("http://169.254.169.254/mcp", allowed_hosts=["169.254.169.254"])
+
+    @pytest.mark.asyncio
+    async def test_allowed_hosts_is_case_insensitive_and_exact(self) -> None:
+        await _validate_server_url("http://INTERNAL.CORP/mcp", allowed_hosts=["internal.corp"])
+
+    @pytest.mark.asyncio
+    async def test_allowed_hosts_does_not_widen_beyond_listed_host(self) -> None:
+        """Allowlisting one private host must not allow a different private host."""
+        with pytest.raises(MCPServerURLBlockedError):
+            await _validate_server_url("http://10.0.0.9/mcp", allowed_hosts=["10.0.0.5"])
+
+    @pytest.mark.asyncio
+    async def test_rejects_url_with_no_host(self) -> None:
+        with pytest.raises(MCPServerURLBlockedError, match="no resolvable host"):
+            await _validate_server_url("not-a-url", None)
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_hostname_does_not_raise(self) -> None:
+        """A hostname is a DNS-resolution concern for the real connect, not this guard.
+
+        ``.invalid`` is reserved by RFC 2606 to never resolve, so this
+        exercises the "resolution failed" branch deterministically without
+        depending on network access: no candidates are found, so nothing is
+        classified, and validation passes (the eventual connection attempt
+        surfaces its own, already-handled, "could not connect" error).
+        """
+        await _validate_server_url("https://does-not-exist.invalid/mcp", None)
+
+
+class TestInvokeToolBlocksDisallowedServerUrl:
+    """End-to-end through ``DefaultMCPToolHandler.invoke_tool`` -- no tool is ever constructed."""
+
+    @pytest.mark.asyncio
+    async def test_metadata_endpoint_rejected_before_any_connection_attempt(self) -> None:
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            result = await handler.invoke_tool(_invocation(server_url="http://169.254.169.254/latest/meta-data/"))
+        assert result.is_error is True
+        assert "link-local" in (result.error_message or "")
+        # No MCPStreamableHTTPTool was ever constructed for the blocked target.
+        assert FakeTool.instances == []
+
+    @pytest.mark.asyncio
+    async def test_private_ip_rejected_before_any_connection_attempt(self) -> None:
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            result = await handler.invoke_tool(_invocation(server_url="https://10.0.0.5/internal-mcp"))
+        assert result.is_error is True
+        assert FakeTool.instances == []
+
+    @pytest.mark.asyncio
+    async def test_blocked_call_does_not_populate_cache_or_inflight(self) -> None:
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            await handler.invoke_tool(_invocation(server_url="http://169.254.169.254/"))
+        assert handler._inflight == {}
+        assert len(handler._cache) == 0
+
+    @pytest.mark.asyncio
+    async def test_headers_never_attached_for_blocked_target(self) -> None:
+        """Auth-bearing headers must never reach ``header_provider``/the tool for a blocked target."""
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            result = await handler.invoke_tool(
+                _invocation(server_url="http://169.254.169.254/", headers={"Authorization": "Bearer super-secret"}),
+            )
+        assert result.is_error is True
+        assert FakeTool.instances == []
+        assert "super-secret" not in (result.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_public_looking_ip_literal_is_unaffected(self) -> None:
+        """A normal target still connects exactly as before the guard was added."""
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            result = await handler.invoke_tool(_invocation(server_url="https://8.8.8.8/mcp"))
+        assert result.is_error is False
+        assert len(FakeTool.instances) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_hosts_permits_explicitly_trusted_internal_server(self) -> None:
+        handler = DefaultMCPToolHandler(allowed_hosts=["169.254.169.254"])
+        with _patch_tool():
+            result = await handler.invoke_tool(_invocation(server_url="http://169.254.169.254/"))
+        assert result.is_error is False
+        assert len(FakeTool.instances) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_tools_reserved_name_also_goes_through_the_guard(self) -> None:
+        """The ``tools/list`` fast path still connects, so it is covered too."""
+        handler = DefaultMCPToolHandler()
+        with _patch_tool():
+            result = await handler.invoke_tool(
+                _invocation(server_url="http://169.254.169.254/", tool_name=DefaultMCPToolHandler.LIST_TOOLS_TOOL_NAME),
+            )
+        assert result.is_error is True
+        assert FakeTool.instances == []
