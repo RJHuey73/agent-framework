@@ -91,6 +91,7 @@ from ._http_handler import (
 )
 from ._mcp_handler import (
     DefaultMCPToolHandler,
+    MCPServerURLBlockedError,
     MCPToolHandler,
     MCPToolInvocation,
     MCPToolResult,
@@ -147,6 +148,7 @@ __all__ = [
     "JoinExecutor",
     "LoopControl",
     "LoopIterationResult",
+    "MCPServerURLBlockedError",
     "MCPToolApprovalRequest",
     "MCPToolHandler",
     "MCPToolInvocation",

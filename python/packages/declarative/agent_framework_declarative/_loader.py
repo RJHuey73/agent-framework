@@ -238,7 +238,11 @@ class AgentFactory:
                 Which means you must make sure you are using the standard env variable names of the classes
                 you are using and not custom ones and remove the powerfx statements that start with `=Env.`.
                 Only when you trust the source of your yaml files, you can set safe_mode to False
-                via the AgentFactory constructor.
+                via the AgentFactory constructor. Even with safe_mode=False, a `=Env.NAME` expression only
+                ever exposes the specific `NAME`(s) it references -- never the full process environment --
+                so trusting a YAML enough to let it read its own declared env vars does not also hand it
+                every unrelated secret (cloud credentials, other services' API keys, etc.) that happens to
+                be set in the process.
             env_file_path: The path to the .env file to load environment variables from.
             env_file_encoding: The encoding of the .env file, defaults to 'utf-8'.
 

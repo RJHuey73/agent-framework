@@ -12,11 +12,23 @@ Mirrors the .NET ``IMcpToolHandler`` / ``DefaultMcpToolHandler`` pair from
   per-server auth, etc.).
 - :class:`DefaultMCPToolHandler` — production-grade default backed by
   :class:`agent_framework.MCPStreamableHTTPTool`.
+- :class:`MCPServerURLBlockedError` — raised by :class:`DefaultMCPToolHandler`
+  when a ``server_url`` targets a private/loopback/link-local/reserved
+  address (see Security note below).
 
-Security note: :class:`DefaultMCPToolHandler` performs **no** URL filtering or
-SSRF protection. Production deployments should supply a custom handler that
-enforces an allowlist or DNS-rebinding-resistant policy. This split mirrors the
-.NET design.
+Security note: :class:`DefaultMCPToolHandler` resolves ``server_url`` before
+connecting and rejects targets that classify as private, loopback,
+link-local, or reserved per :mod:`ipaddress` (this also covers the
+``169.254.0.0/16`` link-local range used by cloud metadata endpoints). A
+workflow author can explicitly trust a specific internal host via the
+``allowed_hosts`` constructor argument; everything else in those ranges stays
+blocked. This guard defends against a workflow whose ``serverUrl`` PowerFx
+expression is (even partially) bound to untrusted conversation/state input
+being redirected to an internal service. It does **not** fully close a
+DNS-rebinding window (the resolved address is validated once, before
+``connect()``, not pinned for the lifetime of the connection) — a custom
+:class:`MCPToolHandler` implementation is still the right place for a
+stronger, DNS-rebinding-resistant policy. This split mirrors the .NET design.
 
 Prompt-injection note: MCP tool outputs flow back into agent conversations
 (via ``conversationId`` and Tool-role messages emitted by the executor) so
@@ -28,12 +40,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
+import socket
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -43,6 +58,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ClientProvider",
     "DefaultMCPToolHandler",
+    "MCPServerURLBlockedError",
     "MCPToolHandler",
     "MCPToolInvocation",
     "MCPToolResult",
@@ -146,6 +162,125 @@ class MCPToolHandler(Protocol):
 ClientProvider = Callable[[MCPToolInvocation], Awaitable["httpx.AsyncClient | None"]]
 
 
+class MCPServerURLBlockedError(ValueError):
+    """Raised when an ``InvokeMcpTool`` ``server_url`` targets a disallowed network address.
+
+    Raised by :meth:`DefaultMCPToolHandler._create_entry` *before* any MCP
+    client is constructed or connected, so no request (and no configured
+    ``headers``) ever reaches the blocked target. Callers that invoke
+    through :meth:`DefaultMCPToolHandler.invoke_tool` never see this
+    exception directly — it is caught alongside other connect failures and
+    surfaced as ``MCPToolResult(is_error=True, ...)``.
+    """
+
+
+# Mirrors the four classifications the SSRF-protection finding calls out by
+# name (``is_private`` / ``is_loopback`` / ``is_link_local`` / ``is_reserved``);
+# ``is_unspecified`` (0.0.0.0 / ::) and ``is_multicast`` are included as
+# additional defense-in-depth since neither is a legitimate MCP server
+# target. Order matters only for the human-readable reason string.
+_BLOCKED_IP_PREDICATES: tuple[tuple[str, str], ...] = (
+    ("is_loopback", "loopback"),
+    ("is_link_local", "link-local"),  # covers 169.254.0.0/16, incl. cloud metadata endpoints
+    ("is_unspecified", "unspecified"),  # 0.0.0.0 / :: -- checked before is_private for a precise reason
+    ("is_private", "private"),
+    ("is_reserved", "reserved"),
+    ("is_multicast", "multicast"),
+)
+
+
+def _blocked_ip_reason(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Return a short reason (e.g. ``"link-local"``) if ``ip`` must not be reached, else ``None``.
+
+    Pure/synchronous: takes an already-parsed address, does no I/O. Kept
+    separate from URL parsing and DNS resolution so it can be unit-tested
+    directly against hardcoded IP strings without needing a live resolver.
+    """
+    for attr, reason in _BLOCKED_IP_PREDICATES:
+        if getattr(ip, attr):
+            return reason
+    return None
+
+
+_DNS_RESOLVE_TIMEOUT_SECONDS = 5.0
+
+
+async def _resolve_host_ips(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Best-effort DNS resolution of ``host`` to its candidate IP addresses.
+
+    Runs the blocking :func:`socket.getaddrinfo` call off the event loop,
+    bounded by :data:`_DNS_RESOLVE_TIMEOUT_SECONDS`. Returns an empty list
+    (rather than raising) when resolution fails or times out -- a DNS
+    failure is not itself evidence of an SSRF attempt, and the real MCP
+    connection attempt below will surface its own (already-handled)
+    connection error for a genuinely unreachable host. The timeout keeps a
+    slow/unreachable resolver from stalling this pre-connect check itself.
+    """
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.to_thread(socket.getaddrinfo, host, None),
+            timeout=_DNS_RESOLVE_TIMEOUT_SECONDS,
+        )
+    except (OSError, socket.gaierror, asyncio.TimeoutError):
+        # ``asyncio.TimeoutError`` is the builtin ``TimeoutError`` on 3.11+ but a
+        # distinct class pre-3.11 (this package supports 3.10+); name it
+        # explicitly so the timeout is caught on every supported version.
+        return []
+    results: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        sockaddr = info[4]
+        try:
+            results.append(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            # Not an IP literal we recognise; skip rather than fail the whole lookup.
+            continue
+    return results
+
+
+async def _validate_server_url(server_url: str, allowed_hosts: Collection[str] | None) -> None:
+    """Reject ``server_url`` if it targets a private/loopback/link-local/reserved address.
+
+    The host component is checked directly as an IP literal first (no
+    network call needed); if it is not an IP literal, it is resolved via DNS
+    and every returned address is checked. A host listed in ``allowed_hosts``
+    (case-insensitive, exact match against the URL's host component) bypasses
+    the IP classification entirely -- this is the explicit, per-host opt-in
+    for a workflow author who intentionally targets an internal MCP server.
+
+    Args:
+        server_url: The evaluated ``InvokeMcpTool`` server URL.
+        allowed_hosts: Optional collection of hostnames/IP literals the
+            workflow author has explicitly vetted; matching hosts skip the
+            private-range check entirely.
+
+    Raises:
+        MCPServerURLBlockedError: ``server_url`` has no host component, or
+            the host (directly or via DNS) resolves to a disallowed address
+            and is not covered by ``allowed_hosts``.
+    """
+    host = urlparse(server_url).hostname
+    if not host:
+        raise MCPServerURLBlockedError(f"InvokeMcpTool server_url {server_url!r} has no resolvable host.")
+
+    if allowed_hosts and host.lower() in {allowed.lower() for allowed in allowed_hosts}:
+        return
+
+    try:
+        candidates = [ipaddress.ip_address(host)]
+    except ValueError:
+        # Not an IP literal -- it's a hostname; resolve it.
+        candidates = await _resolve_host_ips(host)
+
+    for ip in candidates:
+        reason = _blocked_ip_reason(ip)
+        if reason is not None:
+            raise MCPServerURLBlockedError(
+                f"InvokeMcpTool server_url {server_url!r} resolves to a {reason} address ({ip}); refusing to "
+                "connect. Pass this host in DefaultMCPToolHandler(allowed_hosts=...) if it is an intentional, "
+                "trusted target."
+            )
+
+
 @dataclass
 class _CacheEntry:
     """Internal record stored in the LRU cache."""
@@ -183,8 +318,14 @@ class DefaultMCPToolHandler:
 
     .. warning::
 
-       This handler performs **no** URL filtering or SSRF protection. Wrap
-       or replace it with a custom handler in production deployments.
+       Before connecting, ``server_url`` is resolved and checked against
+       private/loopback/link-local/reserved address ranges (see the module
+       Security note) -- this is an SSRF *mitigation*, not a full policy
+       engine. It does not validate ``headers``/``connection_name``-based
+       auth resolution, does not pin the resolved address against
+       DNS-rebinding, and only ever permits an otherwise-blocked host via
+       exact-match entries in ``allowed_hosts``. Wrap or replace this handler
+       with a custom implementation for a stronger production policy.
 
     Args:
         client_provider: Optional per-server ``httpx.AsyncClient`` provider.
@@ -192,6 +333,13 @@ class DefaultMCPToolHandler:
             the least-recently-used entry is evicted and its client closed
             (only owned clients are closed; caller-supplied ones are not).
             Defaults to ``32``.
+        allowed_hosts: Optional collection of hostnames/IP literals that are
+            explicitly trusted even though they classify as private,
+            loopback, link-local, or reserved (exact match against the
+            ``server_url`` host component, case-insensitive). ``None``
+            (default) allows none of those ranges -- only ordinary,
+            publicly-routable hosts connect. This is the only override for
+            the private-range check; there is no blanket opt-out.
     """
 
     LIST_TOOLS_TOOL_NAME: ClassVar[str] = "tools/list"
@@ -214,10 +362,12 @@ class DefaultMCPToolHandler:
         *,
         client_provider: ClientProvider | None = None,
         cache_max_size: int = _DEFAULT_CACHE_MAX_SIZE,
+        allowed_hosts: Collection[str] | None = None,
     ) -> None:
         if cache_max_size <= 0:
             raise ValueError(f"cache_max_size must be positive, got {cache_max_size}")
         self._client_provider = client_provider
+        self._allowed_hosts = allowed_hosts
         self._cache_max_size = cache_max_size
         self._cache: OrderedDict[tuple[str, str, str, str], _CacheEntry] = OrderedDict()
         # Outer lock guards the cache + in-flight-future map only — never
@@ -503,8 +653,18 @@ class DefaultMCPToolHandler:
         return entry
 
     async def _create_entry(self, invocation: MCPToolInvocation) -> _CacheEntry:
-        """Construct (and connect) a fresh MCP client for ``invocation``."""
+        """Construct (and connect) a fresh MCP client for ``invocation``.
+
+        Validates ``invocation.server_url`` against the private/loopback/
+        link-local/reserved address check *before* doing anything else --
+        including before ``client_provider`` runs and before
+        ``invocation.headers`` are captured into the ``header_provider``
+        closure below -- so a blocked target never has its (potentially
+        auth-bearing) headers attached to any outbound request.
+        """
         from agent_framework import MCPStreamableHTTPTool
+
+        await _validate_server_url(invocation.server_url, self._allowed_hosts)
 
         provided_client: httpx.AsyncClient | None = None
         if self._client_provider is not None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import MutableMapping
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -39,6 +40,47 @@ logger = logging.getLogger("agent_framework.declarative")
 # When False, environment variables CAN be accessed via Env symbol in PowerFx.
 _safe_mode_context: ContextVar[bool] = ContextVar("safe_mode", default=True)
 
+# Matches an ``Env.NAME`` reference inside a PowerFx expression. Mirrors
+# ``agent_framework_declarative._workflows._declarative_base``'s
+# ``_ENV_REFERENCE_RE`` (workflow PowerFx expressions have their own, separate
+# ``Env`` scoping via ``DeclarativeEnvConfig``/``discover_env_references``) --
+# duplicated here rather than imported to keep this module a standalone leaf
+# with no dependency on the ``_workflows`` subpackage.
+_ENV_REFERENCE_RE = re.compile(r"\bEnv\.([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _scoped_env_symbols(expression: str) -> dict[str, str]:
+    """Build a PowerFx ``Env`` symbol table scoped to the names ``expression`` references.
+
+    Used only on the ``safe_mode=False`` path. Rather than exposing the
+    entire process environment (``dict(os.environ)``) to every PowerFx
+    expression, only the ``Env.NAME`` identifiers that literally appear in
+    ``expression`` are pulled from ``os.environ``. A name referenced in the
+    expression but absent from ``os.environ`` is simply omitted -- identical
+    to today's behaviour, where a missing key was never in ``dict(os.environ)``
+    either.
+
+    This keeps unrelated secrets that happen to be set in the process
+    environment (cloud credentials, other services' API keys, ...) out of
+    scope for any expression that never references them, while leaving every
+    documented ``=Env.NAME`` usage working exactly as before. A textual
+    scan (not a full PowerFx parse) is deliberate and matches the same
+    trade-off already accepted by ``discover_env_references`` for workflow
+    expressions: a name that only appears inside a string literal in the
+    expression is a false positive that merely widens the allowlist, never
+    narrows it, so it cannot hide a genuinely-referenced name.
+
+    Args:
+        expression: The raw PowerFx expression text (already stripped of the
+            leading ``=`` marker).
+
+    Returns:
+        A mapping of referenced env-var names to their current values, for
+        only the names actually referenced in ``expression``.
+    """
+    referenced_names = set(_ENV_REFERENCE_RE.findall(expression))
+    return {name: os.environ[name] for name in referenced_names if name in os.environ}
+
 
 @overload
 def _try_powerfx_eval(value: None, log_value: bool = True) -> None: ...
@@ -69,9 +111,15 @@ def _try_powerfx_eval(value: str | None, log_value: bool = True) -> str | None:
         return value
     try:
         safe_mode = _safe_mode_context.get()
+        expression = value[1:]
         if safe_mode:
-            return engine.eval(value[1:])
-        return engine.eval(value[1:], symbols={"Env": dict(os.environ)})
+            return engine.eval(expression)
+        # safe_mode=False still scopes Env to only the names *this* expression
+        # references (see _scoped_env_symbols) rather than the full process
+        # environment -- trusting a YAML source enough to let it read the
+        # env vars it names is a much narrower grant than exposing every
+        # unrelated secret that happens to sit in the process environment.
+        return engine.eval(expression, symbols={"Env": _scoped_env_symbols(expression)})
     except Exception as exc:
         if log_value:
             logger.debug("PowerFx evaluation failed for a value: %s", exc)
